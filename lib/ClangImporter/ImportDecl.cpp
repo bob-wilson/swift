@@ -64,13 +64,34 @@ namespace inferred_attributes {
 }
 }
 
+namespace {
+enum class MakeStructRawValuedFlags {
+  /// whether to also create an unlabeled init
+  MakeUnlabeledValueInit = 0x01,
+
+  /// whether the raw value should be a let
+  IsLet = 0x02,
+
+  /// whether to mark the rawValue as implicit
+  IsImplicit = 0x04,
+};
+using MakeStructRawValuedOptions = OptionSet<MakeStructRawValuedFlags>;
+}
+
+static MakeStructRawValuedOptions
+getDefaultMakeStructRawValuedOptions() {
+  MakeStructRawValuedOptions opts;
+  opts -= MakeStructRawValuedFlags::MakeUnlabeledValueInit; // default off
+  opts |= MakeStructRawValuedFlags::IsLet;                  // default on
+  opts |= MakeStructRawValuedFlags::IsImplicit;             // default on
+  return opts;
+}
 
 static bool isInSystemModule(DeclContext *D) {
   if (cast<ClangModuleUnit>(D->getModuleScopeContext())->isSystemModule())
     return true;
   return false;
 }
-
 
 /// Create a typedpattern(namedpattern(decl))
 static Pattern *createTypedNamedPattern(VarDecl *decl) {
@@ -326,7 +347,7 @@ makeEnumRawValueConstructor(ClangImporter::Implementation &Impl,
   auto enumTy = enumDecl->getDeclaredTypeInContext();
   auto metaTy = MetatypeType::get(enumTy);
   
-  auto selfDecl = ParamDecl::createSelf(SourceLoc(), enumDecl,
+  auto selfDecl = ParamDecl::createUnboundSelf(SourceLoc(), enumDecl,
                                         /*static*/false, /*inout*/true);
 
   auto param = new (C) ParamDecl(/*let*/ true, SourceLoc(),
@@ -392,7 +413,7 @@ static FuncDecl *makeEnumRawValueGetter(ClangImporter::Implementation &Impl,
                                         VarDecl *rawValueDecl) {
   ASTContext &C = Impl.SwiftContext;
   
-  auto selfDecl = ParamDecl::createSelf(SourceLoc(), enumDecl);
+  auto selfDecl = ParamDecl::createUnboundSelf(SourceLoc(), enumDecl);
   
   ParameterList *params[] = {
     ParameterList::createWithoutLoc(selfDecl),
@@ -449,7 +470,7 @@ static FuncDecl *makeNewtypeBridgedRawValueGetter(
                    VarDecl *storedVar) {
   ASTContext &C = Impl.SwiftContext;
   
-  auto selfDecl = ParamDecl::createSelf(SourceLoc(), structDecl);
+  auto selfDecl = ParamDecl::createUnboundSelf(SourceLoc(), structDecl);
   
   ParameterList *params[] = {
     ParameterList::createWithoutLoc(selfDecl),
@@ -496,7 +517,7 @@ static FuncDecl *makeFieldGetterDecl(ClangImporter::Implementation &Impl,
                                      VarDecl *importedFieldDecl,
                                      ClangNode clangNode = ClangNode()) {
   auto &C = Impl.SwiftContext;
-  auto selfDecl = ParamDecl::createSelf(SourceLoc(), importedDecl);
+  auto selfDecl = ParamDecl::createUnboundSelf(SourceLoc(), importedDecl);
 
   ParameterList *params[] = {
     ParameterList::createWithoutLoc(selfDecl),
@@ -524,7 +545,7 @@ static FuncDecl *makeFieldSetterDecl(ClangImporter::Implementation &Impl,
                                      VarDecl *importedFieldDecl,
                                      ClangNode clangNode = ClangNode()) {
   auto &C = Impl.SwiftContext;
-  auto selfDecl = ParamDecl::createSelf(SourceLoc(), importedDecl,
+  auto selfDecl = ParamDecl::createUnboundSelf(SourceLoc(), importedDecl,
                                         /*isStatic*/false, /*isInOut*/true);
   auto newValueDecl = new (C) ParamDecl(/*isLet */ true,SourceLoc(),SourceLoc(),
                                         Identifier(), SourceLoc(), C.Id_value,
@@ -925,7 +946,7 @@ static bool addErrorDomain(NominalTypeDecl *swiftDecl,
       DeclRefExpr(ConcreteDeclRef(swiftValueDecl), {}, isImplicit);
   ParameterList *params[] = {
       ParameterList::createWithoutLoc(
-          ParamDecl::createSelf(SourceLoc(), swiftDecl, isStatic)),
+          ParamDecl::createUnboundSelf(SourceLoc(), swiftDecl, isStatic)),
       ParameterList::createEmpty(C)};
   auto toStringTy = ParameterList::getFullType(stringTy, params);
 
@@ -1290,10 +1311,19 @@ namespace {
       auto typeDecl = dyn_cast_or_null<TypeDecl>(importedDecl);
       if (!typeDecl) return nullptr;
 
-      // FIXME: We cannot currently handle generic types.
+      // Handle generic types.
+      GenericParamList *genericParams = nullptr;
+      GenericSignature *genericSig = nullptr;
+      auto underlyingType = typeDecl->getDeclaredInterfaceType();
+
       if (auto generic = dyn_cast<GenericTypeDecl>(typeDecl)) {
-        if (generic->getGenericSignature() && !isa<ProtocolDecl>(typeDecl))
-          return nullptr;
+        if (generic->getGenericSignature() && !isa<ProtocolDecl>(typeDecl)) {
+          genericParams = generic->getGenericParams();
+          genericSig = generic->getGenericSignature();
+
+          underlyingType = ArchetypeBuilder::mapTypeIntoContext(
+              generic, underlyingType);
+        }
       }
 
       // Import the declaration context where this name will go. Note that
@@ -1305,15 +1335,15 @@ namespace {
       if (!dc) return nullptr;
 
       // Create the type alias.
-      auto underlyingType = typeDecl->getDeclaredInterfaceType();
       auto alias = Impl.createDeclWithClangNode<TypeAliasDecl>(
                      decl,
                      Impl.importSourceLoc(decl->getLocStart()),
                      swift2Name.Imported.getBaseName(),
                      Impl.importSourceLoc(decl->getLocation()),
                      TypeLoc::withoutLoc(underlyingType),
-                     /*genericparams*/nullptr, dc);
+                     genericParams, dc);
       alias->computeType();
+      alias->setGenericSignature(genericSig);
 
       // Record that this is the Swift 2 version of this declaration.
       Impl.ImportedDecls[{decl->getCanonicalDecl(), true}] = alias;
@@ -1328,11 +1358,20 @@ namespace {
     Decl *importSwiftNewtype(const clang::TypedefNameDecl *decl,
                              clang::SwiftNewtypeAttr *newtypeAttr,
                              DeclContext *dc, Identifier name) {
+      // The only (current) difference between swift_newtype(struct) and
+      // swift_newtype(enum), until we can get real enum support, is that enums
+      // have no un-labeled inits(). This is because enums are to be considered
+      // closed, and if constructed from a rawValue, should be very explicit.
+      bool unlabeledCtor = false;
+
       switch (newtypeAttr->getNewtypeKind()) {
       case clang::SwiftNewtypeAttr::NK_Enum:
-      // TODO: import as closed enum instead
-      // For now, fall through and treat as a struct
+        unlabeledCtor = false;
+        // TODO: import as enum instead
+        break;
+
       case clang::SwiftNewtypeAttr::NK_Struct:
+        unlabeledCtor = true;
         break;
       // No other cases yet
       }
@@ -1420,14 +1459,19 @@ namespace {
       if (!isBridged) {
         // Simple, our stored type is equivalent to our computed
         // type.
+        auto options = getDefaultMakeStructRawValuedOptions();
+        if (unlabeledCtor)
+          options |= MakeStructRawValuedFlags::MakeUnlabeledValueInit;
+
         makeStructRawValued(structDecl, storedUnderlyingType,
-                            synthesizedProtocols, protocols);
+                            synthesizedProtocols, protocols, options);
       } else {
         // We need to make a stored rawValue or storage type, and a
         // computed one of bridged type.
         makeStructRawValuedWithBridge(structDecl, storedUnderlyingType,
                                       computedPropertyUnderlyingType,
-                                      synthesizedProtocols, protocols);
+                                      synthesizedProtocols, protocols,
+                                      /*makeUnlabeledValueInit=*/unlabeledCtor);
       }
 
       Impl.ImportedDecls[{decl->getCanonicalDecl(), useSwift2Name}] =
@@ -1515,9 +1559,9 @@ namespace {
               return typealias;
             }
 
-            // If the pointee is 'const void', 'CFTypeRef', bring it
+            // If the pointee is 'void', 'CFTypeRef', bring it
             // in specifically as AnyObject.
-            if (pointee.isConstVoid()) {
+            if (pointee.isVoid()) {
               auto proto = Impl.SwiftContext.getProtocol(
                                                KnownProtocolKind::AnyObject);
               if (!proto)
@@ -1616,7 +1660,7 @@ namespace {
       auto &context = Impl.SwiftContext;
       
       // Create the 'self' declaration.
-      auto selfDecl = ParamDecl::createSelf(SourceLoc(), structDecl,
+      auto selfDecl = ParamDecl::createUnboundSelf(SourceLoc(), structDecl,
                                             /*static*/false, /*inout*/true);
       
       // self & param.
@@ -1692,9 +1736,6 @@ namespace {
     /// \param synthesizedProtocolAttrs synthesized protocol attributes to add
     /// \param protocols the protocols to make this struct conform to
     /// \param setterAccessibility the accessibility of the raw value's setter
-    /// \param isLet whether the raw value should be a let
-    /// \param makeUnlabeledValueInit whether to also create an unlabeled init
-    /// \param isImplicit whether to mark the rawValue as implicit
     ///
     /// This will perform most of the work involved in making a new Swift struct
     /// be backed by a raw value. This will populated derived protocols and
@@ -1702,29 +1743,30 @@ namespace {
     /// create the inits parameterized over a raw value
     ///
     void makeStructRawValued(
-        StructDecl *structDecl,
-        Type underlyingType,
+        StructDecl *structDecl, Type underlyingType,
         ArrayRef<KnownProtocolKind> synthesizedProtocolAttrs,
         ArrayRef<ProtocolDecl *> protocols,
-        Accessibility setterAccessibility = Accessibility::Private,
-        bool isLet = true,
-        bool makeUnlabeledValueInit = false,
-        bool isImplicit = true) {
+        MakeStructRawValuedOptions options =
+            getDefaultMakeStructRawValuedOptions(),
+        Accessibility setterAccessibility = Accessibility::Private) {
       auto &cxt = Impl.SwiftContext;
       addProtocolsToStruct(structDecl, synthesizedProtocolAttrs, protocols);
 
       // Create a variable to store the underlying value.
       VarDecl *var;
       PatternBindingDecl *patternBinding;
-      std::tie(var, patternBinding) =
-          createVarWithPattern(cxt, structDecl, cxt.Id_rawValue, underlyingType,
-                               isLet, isImplicit, setterAccessibility);
+      std::tie(var, patternBinding) = createVarWithPattern(
+          cxt, structDecl, cxt.Id_rawValue, underlyingType,
+          options.contains(MakeStructRawValuedFlags::IsLet),
+          options.contains(MakeStructRawValuedFlags::IsImplicit),
+          setterAccessibility);
 
       structDecl->setHasDelayedMembers();
 
       // Create constructors to initialize that value from a value of the
       // underlying type.
-      if (makeUnlabeledValueInit)
+      if (options.contains(
+              MakeStructRawValuedFlags::MakeUnlabeledValueInit))
         structDecl->addMember(createValueConstructor(
             structDecl, var,
             /*wantCtorParamNames=*/false,
@@ -1753,14 +1795,12 @@ namespace {
     /// over a bridged type that will cast to the stored type, as appropriate.
     ///
     void makeStructRawValuedWithBridge(
-        StructDecl *structDecl,
-        Type storedUnderlyingType,
-        Type bridgedType,
+        StructDecl *structDecl, Type storedUnderlyingType, Type bridgedType,
         ArrayRef<KnownProtocolKind> synthesizedProtocolAttrs,
-        ArrayRef<ProtocolDecl *> protocols) {
+        ArrayRef<ProtocolDecl *> protocols,
+        bool makeUnlabeledValueInit = false) {
       auto &cxt = Impl.SwiftContext;
-      addProtocolsToStruct(structDecl, synthesizedProtocolAttrs,
-                           protocols);
+      addProtocolsToStruct(structDecl, synthesizedProtocolAttrs, protocols);
 
       auto storedVarName = cxt.getIdentifier("_rawValue");
       auto computedVarName = cxt.Id_rawValue;
@@ -1775,18 +1815,16 @@ namespace {
       //
       // Create a computed value variable
       auto computedVar = new (cxt) VarDecl(/*static*/ false,
-                                           /*IsLet*/ false,
-                                           SourceLoc(), computedVarName,
-                                           bridgedType, structDecl);
+                                           /*IsLet*/ false, SourceLoc(),
+                                           computedVarName, bridgedType,
+                                           structDecl);
       computedVar->setImplicit();
       computedVar->setAccessibility(Accessibility::Public);
       computedVar->setSetterAccessibility(Accessibility::Private);
 
       // Create the getter for the computed value variable.
-      auto computedVarGetter = makeNewtypeBridgedRawValueGetter(Impl,
-                                                                structDecl,
-                                                                computedVar,
-                                                                storedVar);
+      auto computedVarGetter = makeNewtypeBridgedRawValueGetter(
+          Impl, structDecl, computedVar, storedVar);
 
       // Create a pattern binding to describe the variable.
       Pattern *computedVarPattern = createTypedNamedPattern(computedVar);
@@ -1794,26 +1832,56 @@ namespace {
           cxt, SourceLoc(), StaticSpellingKind::None, SourceLoc(),
           computedVarPattern, nullptr, structDecl);
 
-      auto init = createValueConstructor(structDecl, computedVar,
-                                         /*wantCtorParamNames=*/true,
+      // Don't bother synthesizing the body if we've already finished
+      // type-checking.
+      bool wantBody = !Impl.hasFinishedTypeChecking();
+
+      auto init = createRawValueBridgingConstructor(
+          structDecl, computedVar, storedVar,
+          /*wantLabel*/ true, wantBody);
+
+      ConstructorDecl *unlabeledCtor = nullptr;
+      if (makeUnlabeledValueInit)
+        unlabeledCtor = createRawValueBridgingConstructor(
+            structDecl, computedVar, storedVar,
+            /*wantLabel*/ false, wantBody);
+
+      structDecl->setHasDelayedMembers();
+      if (unlabeledCtor)
+        structDecl->addMember(unlabeledCtor);
+      structDecl->addMember(init);
+      structDecl->addMember(storedPatternBinding);
+      structDecl->addMember(storedVar);
+      structDecl->addMember(computedPatternBinding);
+      structDecl->addMember(computedVar);
+      structDecl->addMember(computedVarGetter);
+    }
+
+    /// Create a rawValue-ed constructor that bridges to its underlying storage.
+    ConstructorDecl *createRawValueBridgingConstructor(
+        StructDecl *structDecl, VarDecl *computedRawValue,
+        VarDecl *storedRawValue, bool wantLabel, bool wantBody) {
+      auto &cxt = Impl.SwiftContext;
+      auto init = createValueConstructor(structDecl, computedRawValue,
+                                         /*wantCtorParamNames=*/wantLabel,
                                          /*wantBody=*/false);
       // Insert our custom init body
-      if (!Impl.hasFinishedTypeChecking()) {
+      if (wantBody) {
         auto selfDecl = init->getParameterList(0)->get(0);
 
         // Construct left-hand side.
         Expr *lhs = new (cxt) DeclRefExpr(selfDecl, DeclNameLoc(),
                                           /*Implicit=*/true);
-        lhs = new (cxt) MemberRefExpr(lhs, SourceLoc(), storedVar,
+        lhs = new (cxt) MemberRefExpr(lhs, SourceLoc(), storedRawValue,
                                       DeclNameLoc(), /*Implicit=*/true);
 
         // Construct right-hand side.
         // FIXME: get the parameter from the init, and plug it in here.
         auto rhs = new (cxt)
-            CoerceExpr(new (cxt) DeclRefExpr(
-                        init->getParameterList(1)->get(0), 
-                        DeclNameLoc(),
-                        /*Implicit=*/true), {}, {nullptr, storedUnderlyingType});
+            CoerceExpr(new (cxt) DeclRefExpr(init->getParameterList(1)->get(0),
+                                             DeclNameLoc(),
+                                             /*Implicit=*/true),
+                       {}, {nullptr, storedRawValue->getType()});
 
         // Add assignment.
         auto assign = new (cxt) AssignExpr(lhs, SourceLoc(), rhs,
@@ -1822,13 +1890,7 @@ namespace {
         init->setBody(body);
       }
 
-      structDecl->setHasDelayedMembers();
-      structDecl->addMember(init);
-      structDecl->addMember(storedPatternBinding);
-      structDecl->addMember(storedVar);
-      structDecl->addMember(computedPatternBinding);
-      structDecl->addMember(computedVar);
-      structDecl->addMember(computedVarGetter);
+      return init;
     }
 
     /// \brief Create a constructor that initializes a struct from its members.
@@ -1839,7 +1901,7 @@ namespace {
       auto &context = Impl.SwiftContext;
 
       // Create the 'self' declaration.
-      auto selfDecl = ParamDecl::createSelf(SourceLoc(), structDecl,
+      auto selfDecl = ParamDecl::createUnboundSelf(SourceLoc(), structDecl,
                                             /*static*/false, /*inout*/true);
 
       // Construct the set of parameters from the list of members.
@@ -2004,7 +2066,8 @@ namespace {
                                const clang::EnumDecl *clangEnum,
                                NominalTypeDecl *theStruct) {
       Optional<ImportedName> swift3Name;
-      auto name = importFullName(decl, swift3Name).Imported.getBaseName();
+      ImportedName nameInfo = importFullName(decl, swift3Name);
+      Identifier name = nameInfo.Imported.getBaseName();
       if (name.empty())
         return nullptr;
 
@@ -2021,7 +2084,8 @@ namespace {
       // NS_OPTIONS members that have a value of 0 (typically named "None") do
       // not operate as a set-like member.  Mark them unavailable with a message
       // that says that they should be used as [].
-      if (!decl->getInitVal() && !CD->getAttrs().hasAttribute<AvailableAttr>()){
+      if (decl->getInitVal() == 0 && !nameInfo.HasCustomName &&
+          !CD->getAttrs().isUnavailable(Impl.SwiftContext)) {
         /// Create an AvailableAttr that indicates specific availability
         /// for all platforms.
         auto attr =
@@ -2176,12 +2240,16 @@ namespace {
         ProtocolDecl *protocols[]
           = {cxt.getProtocol(KnownProtocolKind::RawRepresentable),
              cxt.getProtocol(KnownProtocolKind::Equatable)};
+
+        auto options = getDefaultMakeStructRawValuedOptions();
+        options |= MakeStructRawValuedFlags::MakeUnlabeledValueInit;
+        options -= MakeStructRawValuedFlags::IsLet;
+        options -= MakeStructRawValuedFlags::IsImplicit;
+
         makeStructRawValued(structDecl, underlyingType,
                             {KnownProtocolKind::RawRepresentable}, protocols,
-                            /*setterAccessibility=*/Accessibility::Public,
-                            /*isLet=*/false,
-                            /*makeUnlabeledValueInit=*/true,
-                            /*isImplicit=*/false);
+                            options,
+                            /*setterAccessibility=*/Accessibility::Public);
 
         result = structDecl;
         break;
@@ -2782,7 +2850,7 @@ namespace {
 
       bool selfIsInOut =
           !dc->getDeclaredTypeOfContext()->hasReferenceSemantics();
-      auto selfParam = ParamDecl::createSelf(SourceLoc(), dc, /*static=*/false,
+      auto selfParam = ParamDecl::createUnboundSelf(SourceLoc(), dc, /*static=*/false,
                                              /*inout=*/selfIsInOut);
 
       OptionalTypeKind initOptionality;
@@ -2849,7 +2917,7 @@ namespace {
       }
 
       bodyParams.push_back(ParameterList::createWithoutLoc(
-          ParamDecl::createSelf(SourceLoc(), dc, !selfIdx.hasValue(),
+          ParamDecl::createUnboundSelf(SourceLoc(), dc, !selfIdx.hasValue(),
                                 selfIsInOut)));
       bodyParams.push_back(getNonSelfParamList(
           decl, selfIdx, name.getArgumentNames(), allowNSUIntegerAsInt, !name));
@@ -3563,7 +3631,7 @@ namespace {
       // Add the implicit 'self' parameter patterns.
       SmallVector<ParameterList *, 4> bodyParams;
       auto selfVar =
-        ParamDecl::createSelf(SourceLoc(), dc, /*isStatic*/!isInstance);
+        ParamDecl::createUnboundSelf(SourceLoc(), dc, /*isStatic*/!isInstance);
       bodyParams.push_back(ParameterList::createWithoutLoc(selfVar));
       Type selfInterfaceType;
       if (dc->getAsProtocolOrProtocolExtensionContext()) {
@@ -3999,7 +4067,7 @@ namespace {
 
       // Add the implicit 'self' parameter patterns.
       SmallVector<ParameterList*, 4> bodyParams;
-      auto selfMetaVar = ParamDecl::createSelf(SourceLoc(), dc, /*static*/true);
+      auto selfMetaVar = ParamDecl::createUnboundSelf(SourceLoc(), dc, /*static*/true);
       auto selfTy = dc->getDeclaredTypeInContext();
       auto selfMetaTy = MetatypeType::get(selfTy);
       bodyParams.push_back(ParameterList::createWithoutLoc(selfMetaVar));
@@ -4117,7 +4185,7 @@ namespace {
       if (known != Impl.Constructors.end())
         return known->second;
 
-      auto *selfVar = ParamDecl::createSelf(SourceLoc(), dc);
+      auto *selfVar = ParamDecl::createUnboundSelf(SourceLoc(), dc);
 
       // Create the actual constructor.
       auto result = Impl.createDeclWithClangNode<ConstructorDecl>(objcMethod,
@@ -6810,7 +6878,7 @@ ClangImporter::Implementation::createConstant(Identifier name, DeclContext *dc,
   
   // 'self'
   if (dc->isTypeContext()) {
-    auto *selfDecl = ParamDecl::createSelf(SourceLoc(), dc, isStatic);
+    auto *selfDecl = ParamDecl::createUnboundSelf(SourceLoc(), dc, isStatic);
     getterArgs.push_back(ParameterList::createWithoutLoc(selfDecl));
   }
   

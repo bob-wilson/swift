@@ -784,6 +784,9 @@ void CodeCompletionResultBuilder::setAssociatedDecl(const Decl *D) {
 
   if (!CurrentModule)
     CurrentModule = D->getModuleContext();
+
+  if (D->getAttrs().getDeprecated(D->getASTContext()))
+    setNotRecommended(CodeCompletionResult::Deprecated);
 }
 
 StringRef CodeCompletionContext::copyString(StringRef Str) {
@@ -1358,7 +1361,7 @@ public:
   void completeReturnStmt(CodeCompletionExpr *E) override;
   void completeAfterPound(CodeCompletionExpr *E, StmtKind ParentKind) override;
   void completeGenericParams(TypeLoc TL) override;
-  void addKeywords(CodeCompletionResultSink &Sink);
+  void addKeywords(CodeCompletionResultSink &Sink, bool MaybeFuncBody);
 
   void doneParsing() override;
 
@@ -1932,9 +1935,10 @@ public:
   }
 
   void addVarDeclRef(const VarDecl *VD, DeclVisibilityKind Reason) {
-    if (!VD->hasName())
-      return;
-    if (!VD->isUserAccessible())
+    if (!VD->hasName() ||
+        !VD->isUserAccessible() ||
+        (VD->hasAccessibility() && !VD->isAccessibleFrom(CurrDeclContext)) ||
+        AvailableAttr::isUnavailable(VD))
       return;
 
     StringRef Name = VD->getName().get();
@@ -2520,7 +2524,9 @@ public:
   void addEnumElementRef(const EnumElementDecl *EED,
                          DeclVisibilityKind Reason,
                          bool HasTypeContext) {
-    if (!EED->hasName())
+    if (!EED->hasName() ||
+        (EED->hasAccessibility() && !EED->isAccessibleFrom(CurrDeclContext)) ||
+        AvailableAttr::isUnavailable(EED))
       return;
     CommandWordsPairs Pairs;
     CodeCompletionResultBuilder Builder(
@@ -4445,8 +4451,11 @@ static void addDeclKeywords(CodeCompletionResultSink &Sink) {
   AddCSKeyword("convenience");
 }
 
-static void addStmtKeywords(CodeCompletionResultSink &Sink) {
+static void addStmtKeywords(CodeCompletionResultSink &Sink, bool MaybeFuncBody) {
   auto AddKeyword = [&](StringRef Name, CodeCompletionKeywordKind Kind) {
+    if (!MaybeFuncBody && Kind == CodeCompletionKeywordKind::kw_return)
+      return;
+
     CodeCompletionResultBuilder Builder(
         Sink, CodeCompletionResult::ResultKind::Keyword,
         SemanticContextKind::None, {});
@@ -4499,7 +4508,8 @@ static void addExprKeywords(CodeCompletionResultSink &Sink) {
 }
 
 
-void CodeCompletionCallbacksImpl::addKeywords(CodeCompletionResultSink &Sink) {
+void CodeCompletionCallbacksImpl::addKeywords(CodeCompletionResultSink &Sink,
+                                              bool MaybeFuncBody) {
   switch (Kind) {
   case CompletionKind::None:
   case CompletionKind::DotExpr:
@@ -4517,7 +4527,7 @@ void CodeCompletionCallbacksImpl::addKeywords(CodeCompletionResultSink &Sink) {
 
   case CompletionKind::StmtOrExpr:
     addDeclKeywords(Sink);
-    addStmtKeywords(Sink);
+    addStmtKeywords(Sink, MaybeFuncBody);
     SWIFT_FALLTHROUGH;
   case CompletionKind::AssignmentRHS:
   case CompletionKind::ReturnStmtExpr:
@@ -4772,8 +4782,15 @@ void CodeCompletionCallbacksImpl::doneParsing() {
     return;
   }
 
+  bool MaybeFuncBody = true;
+  if (CurDeclContext) {
+    auto *CD = CurDeclContext->getLocalContext();
+    if (!CD || CD->getContextKind() == DeclContextKind::Initializer ||
+        CD->getContextKind() == DeclContextKind::TopLevelCodeDecl)
+      MaybeFuncBody = false;
+  }
   // Add keywords even if type checking fails completely.
-  addKeywords(CompletionContext.getResultSink());
+  addKeywords(CompletionContext.getResultSink(), MaybeFuncBody);
 
   if (!typecheckContext())
     return;

@@ -30,7 +30,7 @@ umask 0022
 # need to change any of these, you should do so on trunk or in a branch.
 #
 
-LLVM_TARGETS_TO_BUILD="X86;ARM;AArch64;PowerPC"
+LLVM_TARGETS_TO_BUILD="X86;ARM;AArch64;PowerPC;SystemZ"
 
 #
 # End of configurable options.
@@ -60,7 +60,7 @@ KNOWN_SETTINGS=(
     host-cc                     ""               "the path to CC, the 'clang' compiler for the host platform. **This argument is required**"
     host-cxx                    ""               "the path to CXX, the 'clang++' compiler for the host platform. **This argument is required**"
     darwin-xcrun-toolchain      "default"        "the name of the toolchain to use on Darwin"
-    build-ninja                 ""               "build the Ninja tool"
+    ninja-bin                   ""               "the path to Ninja tool"
     cmark-build-type            "Debug"          "the CMake build variant for CommonMark (Debug, RelWithDebInfo, Release, MinSizeRel).  Defaults to Debug."
     lldb-extra-cmake-args       ""               "extra command line args to pass to lldb cmake"
     lldb-extra-xcodebuild-args  ""               "extra command line args to pass to lldb xcodebuild"
@@ -317,6 +317,7 @@ function set_deployment_target_based_options() {
 
     case ${deployment_target} in
         linux-x86_64)
+            USE_GOLD_LINKER=1
             SWIFT_HOST_VARIANT_ARCH="x86_64"
             ;;
         linux-armv6)
@@ -338,10 +339,15 @@ function set_deployment_target_based_options() {
             SWIFT_HOST_VARIANT_ARCH="x86_64"
             ;;
         linux-powerpc64)
+            USE_GOLD_LINKER=1
             SWIFT_HOST_VARIANT_ARCH="powerpc64"
             ;;
         linux-powerpc64le)
+            USE_GOLD_LINKER=1
             SWIFT_HOST_VARIANT_ARCH="powerpc64le"
+            ;;
+        linux-s390x)
+            SWIFT_HOST_VARIANT_ARCH="s390x"
             ;;
         cygwin-x86_64)
             SWIFT_HOST_VARIANT_ARCH="x86_64"
@@ -521,6 +527,7 @@ function set_deployment_target_based_options() {
                 -DLLVM_HOST_TRIPLE:STRING="${llvm_host_triple}"
                 -DLLVM_ENABLE_LIBCXX:BOOL=TRUE
                 -DLLVM_TOOL_COMPILER_RT_BUILD:BOOL="$(false_true ${SKIP_COMPILER_RT})"
+                -DLLVM_BUILD_EXTERNAL_COMPILER_RT:BOOL="$(false_true ${SKIP_COMPILER_RT})"
                 -DCOMPILER_RT_ENABLE_IOS:BOOL=FALSE
                 -DCOMPILER_RT_ENABLE_WATCHOS:BOOL=FALSE
                 -DCOMPILER_RT_ENABLE_TVOS:BOOL=FALSE
@@ -1251,43 +1258,6 @@ function set_swiftpm_bootstrap_command() {
     fi
 }
 
-mkdir -p "${BUILD_DIR}"
-
-#
-# Build Ninja
-#
-if [[ "${BUILD_NINJA}" ]] ; then
-    build_dir=$(build_directory build ninja)
-    if [ ! -f "${build_dir}/ninja" ] ; then
-        if [ ! -d "${NINJA_SOURCE_DIR}" ] ; then
-          echo "Can't find source directory for ninja (tried ${NINJA_SOURCE_DIR})"
-          exit 1
-        fi
-
-        # Ninja can only be built in-tree.  Copy the source tree to the build
-        # directory.
-        set -x
-        rm -rf "${build_dir}"
-        cp -r "${NINJA_SOURCE_DIR}" "${build_dir}"
-        if [[ $(uname -s) == "Darwin" ]]; then
-          (cd "${build_dir}" && \
-            env CXX=$(xcrun --sdk macosx -find clang++) \
-                CFLAGS="-isysroot $(xcrun --sdk macosx --show-sdk-path) -mmacosx-version-min=${DARWIN_DEPLOYMENT_VERSION_OSX}" \
-                LDFLAGS="-mmacosx-version-min=${DARWIN_DEPLOYMENT_VERSION_OSX}" \
-                python ./configure.py --bootstrap)
-          { set +x; } 2>/dev/null
-        else
-          (cd "${build_dir}" && python ./configure.py --bootstrap)
-          { set +x; } 2>/dev/null
-        fi
-    fi
-    NINJA_BIN="${build_dir}/ninja"
-    COMMON_CMAKE_OPTIONS=(
-        "${COMMON_CMAKE_OPTIONS[@]}"
-        -DCMAKE_MAKE_PROGRAM=${NINJA_BIN}
-    )
-fi
-
 #
 # Configure and build each product
 #
@@ -1802,7 +1772,6 @@ for deployment_target in "${HOST_TARGET}" "${CROSS_COMPILE_TOOLS_DEPLOYMENT_TARG
                 SWIFT_BIN="$(build_directory_bin ${deployment_target} swift)/swift"
                 SWIFT_BUILD_PATH="$(build_directory ${deployment_target} swift)"
                 LLVM_BIN="$(build_directory_bin ${deployment_target} llvm)"
-                NINJA_BIN="ninja"
 
                 # Staging: require opt-in for building with dispatch
                 if [[ ! "${SKIP_BUILD_LIBDISPATCH}" ]] ; then
@@ -1814,11 +1783,6 @@ for deployment_target in "${HOST_TARGET}" "${CROSS_COMPILE_TOOLS_DEPLOYMENT_TARG
                     SWIFT_USE_LINKER="-fuse-ld=gold"
                 fi
 
-                if [[ "${BUILD_NINJA}" ]]; then
-                    NINJA_BUILD_DIR=$(build_directory build ninja)
-                    NINJA_BIN="${NINJA_BUILD_DIR}/ninja"
-                fi
-                
                 set -x
                 pushd "${FOUNDATION_SOURCE_DIR}"
                 SWIFTC="${SWIFTC_BIN}" CLANG="${LLVM_BIN}"/clang SWIFT="${SWIFT_BIN}" \
@@ -1881,7 +1845,35 @@ for deployment_target in "${HOST_TARGET}" "${CROSS_COMPILE_TOOLS_DEPLOYMENT_TARG
                     ( ! -z "${generator_output_path}" && ! -f "${generator_output_path}" ) ]] ; then
             set -x
             mkdir -p "${build_dir}"
-            (cd "${build_dir}" && "${CMAKE}" "${cmake_options[@]}" "${EXTRA_CMAKE_OPTIONS[@]}" "${source_dir}")
+            if [[ -n "${DISTCC}" ]]; then
+                EXTRA_DISTCC_OPTIONS=("DISTCC_HOSTS=localhost,lzo,cpp")
+            fi
+            (cd "${build_dir}" && env "${EXTRA_DISTCC_OPTIONS[@]}" "${CMAKE}" "${cmake_options[@]}" "${EXTRA_CMAKE_OPTIONS[@]}" "${source_dir}")
+            { set +x; } 2>/dev/null
+        fi
+
+        # When we are building LLVM create symlinks to the c++ headers. We need
+        # to do this before building LLVM since compiler-rt depends on being
+        # built with the just built clang compiler. These are normally put into
+        # place during the cmake step of LLVM's build when libcxx is in
+        # tree... but we are not building llvm with libcxx in tree when we build
+        # swift. So we need to do configure's work here.
+        if [[ "${product}" == "llvm" ]]; then
+            # Find the location of the c++ header dir.
+            if [[ "$(uname -s)" == "Darwin" ]] ; then
+              HOST_CXX_DIR=$(dirname ${HOST_CXX})
+              HOST_CXX_HEADERS_DIR="$HOST_CXX_DIR/../../usr/include/c++"
+            else # Linux
+              HOST_CXX_HEADERS_DIR="/usr/include/c++"
+            fi
+
+            # Find the path in which the local clang build is expecting to find
+            # the c++ header files.
+            BUILT_CXX_INCLUDE_DIR="$llvm_build_dir/include"
+
+            echo "symlinking the system headers ($HOST_CXX_HEADERS_DIR) into the local clang build directory ($BUILT_CXX_INCLUDE_DIR)."
+            set -x
+            ln -s -f "$HOST_CXX_HEADERS_DIR" "$BUILT_CXX_INCLUDE_DIR"
             { set +x; } 2>/dev/null
         fi
 
@@ -1902,26 +1894,6 @@ for deployment_target in "${HOST_TARGET}" "${CROSS_COMPILE_TOOLS_DEPLOYMENT_TARG
 
             set -x
             ${DISTCC_PUMP} "${CMAKE}" --build "${build_dir}" $(cmake_config_opt ${product}) -- "${BUILD_ARGS[@]}" ${build_targets[@]}
-            { set +x; } 2>/dev/null
-        fi
-
-        # When we are building LLVM create symlinks to the c++ headers.
-        if [[ "${product}" == "llvm" ]]; then
-            # Find the location of the c++ header dir.
-            if [[ "$(uname -s)" == "Darwin" ]] ; then
-              HOST_CXX_DIR=$(dirname ${HOST_CXX})
-              HOST_CXX_HEADERS_DIR="$HOST_CXX_DIR/../../usr/include/c++"
-            else # Linux
-              HOST_CXX_HEADERS_DIR="/usr/include/c++"
-            fi
-
-            # Find the path in which the local clang build is expecting to find
-            # the c++ header files.
-            BUILT_CXX_INCLUDE_DIR="$llvm_build_dir/include"
-
-            echo "symlinking the system headers ($HOST_CXX_HEADERS_DIR) into the local clang build directory ($BUILT_CXX_INCLUDE_DIR)."
-            set -x
-            ln -s -f "$HOST_CXX_HEADERS_DIR" "$BUILT_CXX_INCLUDE_DIR"
             { set +x; } 2>/dev/null
         fi
     done

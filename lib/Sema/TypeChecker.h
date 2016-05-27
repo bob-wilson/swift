@@ -404,6 +404,7 @@ enum class ObjCReason {
   ExplicitlyDynamic,
   ExplicitlyObjC,
   ExplicitlyIBOutlet,
+  ExplicitlyIBAction,
   ExplicitlyNSManaged,
   MemberOfObjCProtocol,
   ImplicitlyObjC,
@@ -1616,7 +1617,7 @@ public:
   bool diagnoseExplicitUnavailability(const ValueDecl *D,
                                       SourceRange R,
                                       const DeclContext *DC,
-                                      const CallExpr *CE);
+                                      const ApplyExpr *call);
 
   /// Emit a diagnostic for references to declarations that have been
   /// marked as unavailable, either through "unavailable" or "obsoleted:".
@@ -1829,7 +1830,7 @@ public:
                           const DeclContext *ReferenceDC,
                           const AvailableAttr *Attr,
                           DeclName Name,
-                          const CallExpr *CE);
+                          const ApplyExpr *Call);
   /// @}
 
   /// If LangOptions::DebugForbidTypecheckPrefix is set and the given decl
@@ -1871,6 +1872,12 @@ public:
                                               AnyMetatypeType *metaTy,
                                               ConstructorDecl *ctorDecl,
                                               bool SuppressDiagnostics);
+
+  /// Attempt to omit needless words from the name of the given declaration.
+  Optional<DeclName> omitNeedlessWords(AbstractFunctionDecl *afd);
+
+  /// Attempt to omit needless words from the name of the given declaration.
+  Optional<Identifier> omitNeedlessWords(VarDecl *var);
 
   /// Check for needless words in the name of the given function/constructor.
   void checkOmitNeedlessWords(AbstractFunctionDecl *afd);
@@ -1933,12 +1940,6 @@ public:
   /// The unescaped message to display to the user.
   const StringRef Message;
 };
-
-/// Attempt to omit needless words from the name of the given declaration.
-Optional<DeclName> omitNeedlessWords(AbstractFunctionDecl *afd);
-
-/// Attempt to omit needless words from the name of the given declaration.
-Optional<Identifier> omitNeedlessWords(VarDecl *var);
 
 } // end namespace swift
 

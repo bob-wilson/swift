@@ -61,17 +61,45 @@ public func strideofValue<T>(_:T) -> Int {
   return strideof(T.self)
 }
 
+// This function is the implementation of the `_roundUp` overload set.  It is
+// marked `@inline(__always)` to make primary `_roundUp` entry points seem
+// cheap enough for the inliner.
 @_versioned
-internal func _roundUp(_ offset: Int, toAlignment alignment: Int) -> Int {
-  _sanityCheck(offset >= 0)
+@inline(__always)
+internal func _roundUpImpl(_ offset: UInt, toAlignment alignment: Int) -> UInt {
   _sanityCheck(alignment > 0)
   _sanityCheck(_isPowerOf2(alignment))
   // Note, given that offset is >= 0, and alignment > 0, we don't
   // need to underflow check the -1, as it can never underflow.
-  let x = (offset + alignment &- 1)
+  let x = offset + UInt(bitPattern: alignment) &- 1
   // Note, as alignment is a power of 2, we'll use masking to efficiently
   // get the aligned value
-  return x & ~(alignment &- 1)
+  return x & ~(UInt(bitPattern: alignment) &- 1)
+}
+
+@_versioned
+internal func _roundUp(_ offset: UInt, toAlignment alignment: Int) -> UInt {
+  return _roundUpImpl(offset, toAlignment: alignment)
+}
+
+@_versioned
+internal func _roundUp(_ offset: Int, toAlignment alignment: Int) -> Int {
+  _sanityCheck(offset >= 0)
+  return Int(_roundUpImpl(UInt(bitPattern: offset), toAlignment: alignment))
+}
+
+@_versioned
+internal func _roundUp<T, DestinationType>(
+  _ pointer: UnsafeMutablePointer<T>,
+  toAlignmentOf destinationType: DestinationType.Type
+) -> UnsafeMutablePointer<DestinationType> {
+  // Note: unsafe unwrap is safe because this operation can only increase the
+  // value, and can not produce a null pointer.
+  return UnsafeMutablePointer<DestinationType>(
+    bitPattern: _roundUpImpl(
+      UInt(bitPattern: pointer),
+      toAlignment: alignof(DestinationType))
+  ).unsafelyUnwrapped
 }
 
 /// Returns a tri-state of 0 = no, 1 = yes, 2 = maybe.
@@ -365,6 +393,19 @@ internal var _objectPointerLowSpareBitShift: UInt {
 @_versioned
 internal var _objCTaggedPointerBits: UInt {
     @inline(__always) get { return 0 }
+}
+#elseif arch(s390x)
+internal var _objectPointerSpareBits: UInt {
+  @inline(__always) get { return 0x0000_0000_0000_0007 }
+}
+internal var _objectPointerIsObjCBit: UInt {
+  @inline(__always) get { return 0x0000_0000_0000_0002 }
+}
+internal var _objectPointerLowSpareBitShift: UInt {
+  @inline(__always) get { return 0 }
+}
+internal var _objCTaggedPointerBits: UInt {
+  @inline(__always) get { return 0 }
 }
 #endif
 

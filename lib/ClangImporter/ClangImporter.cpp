@@ -363,10 +363,13 @@ getNormalInvocationArguments(std::vector<std::string> &invocationArgStrs,
       "-DSWIFT_SDK_OVERLAY2_SPRITEKIT_EPOCH=1",
 
       // Request new APIs from CoreImage.
-      "-DSWIFT_SDK_OVERLAY_COREIMAGE_EPOCH=1",
+      "-DSWIFT_SDK_OVERLAY_COREIMAGE_EPOCH=2",
 
       // Request new APIs from libdispatch.
       "-DSWIFT_SDK_OVERLAY_DISPATCH_EPOCH=0",
+
+      // Request new APIs from libpthread
+      "-DSWIFT_SDK_OVERLAY_PTHREAD_EPOCH=1",
     });
 
     // Get the version of this compiler and pass it to
@@ -774,6 +777,24 @@ void ClangImporter::Implementation::addEntryToLookupTable(
 {
   // Determine whether this declaration is suppressed in Swift.
   if (shouldSuppressDeclImport(named)) return;
+
+  // Leave incomplete struct/enum/union types out of the table; Swift only
+  // handles pointers to them.
+  // FIXME: At some point we probably want to be importing incomplete types,
+  // so that pointers to different incomplete types themselves have distinct
+  // types. At that time it will be necessary to make the decision of whether
+  // or not to import an incomplete type declaration based on whether it's
+  // actually the struct backing a CF type:
+  //
+  //    typedef struct CGColor *CGColorRef;
+  //
+  // The best way to do this is probably to change CFDatabase.def to include
+  // struct names when relevant, not just pointer names. That way we can check
+  // both CFDatabase.def and the objc_bridge attribute and cover all our bases.
+  if (auto *tagDecl = dyn_cast<clang::TagDecl>(named)) {
+    if (!tagDecl->getDefinition())
+      return;
+  }
 
   // If we have a name to import as, add this entry to the table.
   if (auto importedName = importFullName(named, None, &clangSema)) {

@@ -12,6 +12,8 @@ func testOldTypeNames() {
 
 
   _ = NSPostingStyle(rawValue: 1) // expected-error{{'NSPostingStyle' has been renamed to 'PostingStyle'}}{{7-21=PostingStyle}}
+
+  _ = NSSoapDispenser<AnyObject>() // expected-error{{'NSSoapDispenser' has been renamed to 'SoapDispenser'}}{{7-22=SoapDispenser}}
 }
 
 func testOldMethodNames(array: NSArray) {
@@ -93,3 +95,10 @@ class X : NSDocument {
 }
 
 func makeCopy<T: NSWobbling>(thing: T) {} // expected-error {{'NSWobbling' has been renamed to 'Wobbling'}} {{18-28=Wobbling}} 
+
+func useLowercasedEnumCase(x: RuncingMode) {
+  switch x {
+    case .Mince: return // expected-error {{'Mince' has been renamed to 'mince'}} {{11-16=mince}}
+    case .Quince: return // expected-error {{'Quince' has been renamed to 'quince'}} {{11-17=quince}}
+  }
+}
